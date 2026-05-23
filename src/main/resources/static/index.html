@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SentinelLog — Real-time Anomaly Dashboard</title>
+
+  <!-- SockJS + STOMP for WebSocket -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sockjs-client/1.6.1/sockjs.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/stomp.js/2.3.3/stomp.min.js"></script>
+
+  <style>
+    /* ── Design Tokens ─────────────────────────────────── */
+    :root {
+      --bg0:       #0a0c10;
+      --bg1:       #0e1117;
+      --bg2:       #161b22;
+      --bg3:       #1c2128;
+      --border:    #30363d;
+      --border-hi: #484f58;
+      --text-pri:  #e6edf3;
+      --text-sec:  #7d8590;
+      --text-muted:#484f58;
+      --accent:    #58a6ff;
+      --green:     #3fb950;
+      --yellow:    #d29922;
+      --orange:    #e3701a;
+      --red:       #f85149;
+      --red-dim:   #3d1a1a;
+      --red-glow:  rgba(248, 81, 73, 0.15);
+      --purple:    #a371f7;
+      --mono:      'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+      --sans:      'Inter', system-ui, sans-serif;
+    }
+
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--bg0);
+      color: var(--text-pri);
+      font-family: var(--sans);
+      font-size: 13px;
+      line-height: 1.5;
+      overflow: hidden;
+    }
+
+    /* ── Layout ─────────────────────────────────────────── */
+    .shell {
+      display: grid;
+      grid-template-rows: 48px 1fr;
+      grid-template-columns: 260px 1fr 320px;
+      height: 100vh;
+    }
+
+    /* ── Header ─────────────────────────────────────────── */
+    header {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 0 20px;
+      background: var(--bg1);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+      font-size: 14px;
+      letter-spacing: 0.02em;
+    }
+
+    .logo-icon {
+      width: 24px; height: 24px;
+      background: var(--red);
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px;
+    }
+
+    .ws-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--text-sec);
+    }
+
+    .ws-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      transition: background 0.3s;
+    }
+    .ws-dot.connected    { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .ws-dot.connecting   { background: var(--yellow); animation: pulse 1s infinite; }
+
+    .header-stats {
+      display: flex;
+      gap: 24px;
+      font-size: 11px;
+    }
+
+    .hstat { text-align: center; }
+    .hstat-val {
+      font-family: var(--mono);
+      font-size: 16px;
+      font-weight: 500;
+      line-height: 1.1;
+    }
+    .hstat-lbl { color: var(--text-sec); }
+    .val-green { color: var(--green); }
+    .val-red   { color: var(--red); }
+    .val-yellow{ color: var(--yellow); }
+    .val-blue  { color: var(--accent); }
+
+    /* ── Left sidebar: service health ───────────────────── */
+    .sidebar-left {
+      background: var(--bg1);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 12px 0;
+    }
+
+    .panel-title {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-muted);
+      padding: 8px 14px 4px;
+    }
+
+    .service-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 14px;
+      cursor: default;
+      transition: background 0.15s;
+    }
+    .service-item:hover { background: var(--bg2); }
+
+    .svc-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--green);
+      flex-shrink: 0;
+    }
+    .svc-dot.warn   { background: var(--yellow); }
+    .svc-dot.error  { background: var(--red); box-shadow: 0 0 5px var(--red); }
+
+    .svc-name {
+      font-family: var(--mono);
+      font-size: 11px;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .svc-count {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--text-sec);
+    }
+    .svc-count.has-anomaly { color: var(--red); }
+
+    /* Alert ticker in sidebar */
+    .alert-item {
+      margin: 4px 10px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: var(--bg2);
+      border-left: 3px solid var(--border);
+      animation: slideIn 0.3s ease;
+    }
+    .alert-item.CRITICAL { border-color: var(--red);    background: var(--red-dim); }
+    .alert-item.HIGH     { border-color: var(--orange);  }
+    .alert-item.MEDIUM   { border-color: var(--yellow);  }
+    .alert-item.LOW      { border-color: var(--accent);  }
+
+    .alert-title { font-weight: 500; font-size: 11px; margin-bottom: 2px; }
+    .alert-desc  { font-size: 10px; color: var(--text-sec); }
+    .alert-time  { font-size: 10px; color: var(--text-muted); margin-top: 3px; font-family: var(--mono); }
+
+    /* ── Center: log feed ───────────────────────────────── */
+    .log-panel {
+      display: flex;
+      flex-direction: column;
+      background: var(--bg0);
+      overflow: hidden;
+    }
+
+    .log-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      background: var(--bg1);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .filter-btn {
+      padding: 3px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-sec);
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-family: var(--mono);
+    }
+    .filter-btn:hover { border-color: var(--border-hi); color: var(--text-pri); }
+    .filter-btn.active { background: var(--red); border-color: var(--red); color: #fff; }
+
+    .search-box {
+      flex: 1;
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 3px 10px;
+      color: var(--text-pri);
+      font-size: 11px;
+      font-family: var(--mono);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .search-box:focus { border-color: var(--accent); }
+    .search-box::placeholder { color: var(--text-muted); }
+
+    .log-count-badge {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .log-feed {
+      flex: 1;
+      overflow-y: auto;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      line-height: 1.4;
+    }
+
+    /* Custom scrollbar */
+    .log-feed::-webkit-scrollbar { width: 5px; }
+    .log-feed::-webkit-scrollbar-track { background: var(--bg0); }
+    .log-feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    .log-row {
+      display: grid;
+      grid-template-columns: 75px 45px 140px 1fr 60px;
+      gap: 0 10px;
+      padding: 3px 14px;
+      border-bottom: 1px solid transparent;
+      transition: background 0.1s;
+      cursor: default;
+    }
+    .log-row:hover { background: var(--bg2); }
+
+    .log-row.anomaly {
+      background: var(--red-dim);
+      border-bottom-color: rgba(248, 81, 73, 0.2);
+      animation: flashRed 0.6s ease;
+    }
+    .log-row.anomaly:hover { background: #4a1e1e; }
+
+    .log-time   { color: var(--text-muted); }
+    .log-level  { font-weight: 500; }
+    .log-level.DEBUG { color: var(--text-muted); }
+    .log-level.INFO  { color: var(--green); }
+    .log-level.WARN  { color: var(--yellow); }
+    .log-level.ERROR { color: var(--red); }
+    .log-level.FATAL { color: var(--purple); font-weight: 700; }
+    .log-service { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .log-msg    { color: var(--text-sec); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .log-rt     { text-align: right; }
+    .log-rt.slow { color: var(--red); }
+    .log-rt.med  { color: var(--yellow); }
+    .log-rt.fast { color: var(--text-muted); }
+
+    .log-header {
+      display: grid;
+      grid-template-columns: 75px 45px 140px 1fr 60px;
+      gap: 0 10px;
+      padding: 4px 14px;
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+    }
+
+    /* ── Right sidebar: stats + charts ─────────────────── */
+    .sidebar-right {
+      background: var(--bg1);
+      border-left: 1px solid var(--border);
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+    }
+
+    .stat-block {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .stat-card {
+      background: var(--bg2);
+      border-radius: 6px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+    }
+
+    .stat-card-val {
+      font-family: var(--mono);
+      font-size: 20px;
+      font-weight: 500;
+      line-height: 1;
+      margin-bottom: 2px;
+    }
+
+    .stat-card-lbl {
+      font-size: 10px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    /* Sparkline canvas */
+    .sparkline-wrap {
+      padding: 10px 14px 4px;
+    }
+
+    canvas.sparkline {
+      width: 100%;
+      height: 48px;
+      display: block;
+    }
+
+    /* Level bar chart */
+    .level-bars { padding: 4px 0; }
+    .level-bar-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 3px 0;
+    }
+    .level-bar-lbl {
+      font-family: var(--mono);
+      font-size: 10px;
+      width: 40px;
+      flex-shrink: 0;
+    }
+    .level-bar-track {
+      flex: 1;
+      height: 6px;
+      background: var(--bg2);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .level-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.4s ease;
+    }
+    .level-bar-val {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--text-sec);
+      width: 32px;
+      text-align: right;
+      flex-shrink: 0;
+    }
+
+    /* ── Anomaly tooltip ─────────────────────────────────── */
+    .anomaly-badge {
+      display: inline-block;
+      background: var(--red);
+      color: #fff;
+      font-size: 9px;
+      font-weight: 700;
+      padding: 1px 4px;
+      border-radius: 3px;
+      margin-left: 4px;
+      vertical-align: middle;
+      letter-spacing: 0.05em;
+    }
+
+    /* ── Animations ─────────────────────────────────────── */
+    @keyframes flashRed {
+      0%  { background: rgba(248, 81, 73, 0.4); }
+      100%{ background: var(--red-dim); }
+    }
+
+    @keyframes pulse {
+      0%, 100%{ opacity: 1; }
+      50%      { opacity: 0.4; }
+    }
+
+    @keyframes slideIn {
+      from { transform: translateX(-8px); opacity: 0; }
+      to   { transform: translateX(0);    opacity: 1; }
+    }
+
+    @keyframes countUp {
+      from { transform: translateY(4px); opacity: 0; }
+      to   { transform: translateY(0);   opacity: 1; }
+    }
+
+    .bump { animation: countUp 0.2s ease; }
+
+    /* ── Pause overlay ───────────────────────────────────── */
+    .pause-btn {
+      padding: 3px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-sec);
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.15s;
+      margin-left: auto;
+    }
+    .pause-btn:hover { border-color: var(--border-hi); color: var(--text-pri); }
+    .pause-btn.paused { background: var(--yellow); border-color: var(--yellow); color: #000; }
+  </style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ── Header ──────────────────────────────────────────── -->
+  <header>
+    <div class="logo">
+      <div class="logo-icon">⚡</div>
+      SentinelLog
+    </div>
+
+    <div class="header-stats">
+      <div class="hstat">
+        <div class="hstat-val val-blue" id="h-total">0</div>
+        <div class="hstat-lbl">Total Logs</div>
+      </div>
+      <div class="hstat">
+        <div class="hstat-val val-red" id="h-anomalies">0</div>
+        <div class="hstat-lbl">Anomalies</div>
+      </div>
+      <div class="hstat">
+        <div class="hstat-val val-yellow" id="h-rate">0%</div>
+        <div class="hstat-lbl">Anomaly Rate</div>
+      </div>
+      <div class="hstat">
+        <div class="hstat-val val-green" id="h-lps">0</div>
+        <div class="hstat-lbl">Logs/sec</div>
+      </div>
+    </div>
+
+    <div class="ws-status">
+      <div class="ws-dot connecting" id="ws-dot"></div>
+      <span id="ws-label">Connecting…</span>
+    </div>
+  </header>
+
+  <!-- ── Left Sidebar: Services + Alerts ─────────────────── -->
+  <aside class="sidebar-left">
+    <div class="panel-title">Services</div>
+    <div id="service-list"></div>
+
+    <div class="panel-title" style="margin-top:12px">Recent Alerts</div>
+    <div id="alert-list"></div>
+  </aside>
+
+  <!-- ── Center: Log Feed ─────────────────────────────────── -->
+  <main class="log-panel">
+    <div class="log-toolbar">
+      <button class="filter-btn active" id="btn-all"      onclick="setFilter('all')">ALL</button>
+      <button class="filter-btn"        id="btn-anomaly"  onclick="setFilter('anomaly')">ANOMALY</button>
+      <button class="filter-btn"        id="btn-error"    onclick="setFilter('error')">ERROR</button>
+      <button class="filter-btn"        id="btn-warn"     onclick="setFilter('warn')">WARN</button>
+      <input  class="search-box" id="search" placeholder="filter by service, message…" oninput="renderFeed()"/>
+      <button class="pause-btn" id="pause-btn" onclick="togglePause()">⏸ Pause</button>
+      <span   class="log-count-badge" id="log-count">0 / 0</span>
+    </div>
+
+    <div class="log-header">
+      <span>Time</span><span>Level</span><span>Service</span>
+      <span>Message</span><span style="text-align:right">RT (ms)</span>
+    </div>
+
+    <div class="log-feed" id="log-feed"></div>
+  </main>
+
+  <!-- ── Right Sidebar: Stats ─────────────────────────────── -->
+  <aside class="sidebar-right">
+
+    <div class="stat-block">
+      <div class="panel-title" style="padding:0 0 8px">Performance</div>
+      <div class="stat-grid">
+        <div class="stat-card">
+          <div class="stat-card-val val-blue" id="s-avg">—</div>
+          <div class="stat-card-lbl">Avg RT ms</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-val val-yellow" id="s-p99">—</div>
+          <div class="stat-card-lbl">P99 RT ms</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-val val-green" id="s-svc">—</div>
+          <div class="stat-card-lbl">Services</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-val val-red" id="s-anom">—</div>
+          <div class="stat-card-lbl">Anomalies</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stat-block">
+      <div class="panel-title" style="padding:0 0 6px">Log Throughput</div>
+      <div class="sparkline-wrap">
+        <canvas class="sparkline" id="sparkline-canvas"></canvas>
+      </div>
+    </div>
+
+    <div class="stat-block">
+      <div class="panel-title" style="padding:0 0 8px">Level Distribution</div>
+      <div class="level-bars" id="level-bars"></div>
+    </div>
+
+    <div class="stat-block">
+      <div class="panel-title" style="padding:0 0 8px">Anomalies by Service</div>
+      <div class="level-bars" id="anomaly-bars"></div>
+    </div>
+
+  </aside>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────
+const MAX_DISPLAY = 500;
+let logs         = [];          // circular buffer of log entries
+let paused       = false;
+let activeFilter = 'all';
+let searchTerm   = '';
+
+// Throughput sparkline data (last 30 ticks)
+const SPARKLINE_LEN = 30;
+let sparkData = Array(SPARKLINE_LEN).fill(0);
+
+// Service anomaly counters
+const serviceStats = {};
+
+// ── WebSocket connection ─────────────────────────────────
+let stompClient = null;
+
+function connect() {
+  const socket = new SockJS('/ws');
+  stompClient  = Stomp.over(socket);
+  stompClient.debug = null; // silence STOMP debug output
+
+  stompClient.connect({}, () => {
+    setWsStatus(true);
+
+    stompClient.subscribe('/topic/logs', msg => {
+      const entry = JSON.parse(msg.body);
+      onLog(entry);
+    });
+
+    stompClient.subscribe('/topic/alerts', msg => {
+      const alert = JSON.parse(msg.body);
+      onAlert(alert);
+    });
+
+    stompClient.subscribe('/topic/stats', msg => {
+      const stats = JSON.parse(msg.body);
+      onStats(stats);
+    });
+
+    // Hydrate with existing logs on connect
+    fetch('/api/logs?limit=200')
+      .then(r => r.json())
+      .then(entries => {
+        entries.reverse().forEach(e => {
+          logs.unshift(e);
+          trackService(e);
+        });
+        if (logs.length > MAX_DISPLAY) logs = logs.slice(0, MAX_DISPLAY);
+        renderFeed();
+      });
+
+  }, () => {
+    setWsStatus(false);
+    setTimeout(connect, 3000);
+  });
+}
+
+function setWsStatus(connected) {
+  const dot   = document.getElementById('ws-dot');
+  const label = document.getElementById('ws-label');
+  dot.className = 'ws-dot ' + (connected ? 'connected' : 'connecting');
+  label.textContent = connected ? 'Live' : 'Reconnecting…';
+}
+
+// ── Log ingestion ────────────────────────────────────────
+function onLog(entry) {
+  logs.unshift(entry);
+  if (logs.length > MAX_DISPLAY) logs.pop();
+  trackService(entry);
+  if (!paused) renderFeed();
+}
+
+function trackService(entry) {
+  if (!serviceStats[entry.service]) {
+    serviceStats[entry.service] = { total: 0, anomalies: 0, lastLevel: 'INFO' };
+  }
+  serviceStats[entry.service].total++;
+  if (entry.anomaly) serviceStats[entry.service].anomalies++;
+  serviceStats[entry.service].lastLevel = entry.level;
+  renderServices();
+}
+
+// ── Alert ingestion ──────────────────────────────────────
+function onAlert(alert) {
+  const list = document.getElementById('alert-list');
+  const item = document.createElement('div');
+  item.className = 'alert-item ' + alert.severity;
+  item.innerHTML = `
+    <div class="alert-title">${escHtml(alert.title)}</div>
+    <div class="alert-desc">${escHtml(alert.description)}</div>
+    <div class="alert-time">${fmtTime(alert.timestamp)}</div>
+  `;
+  list.insertBefore(item, list.firstChild);
+  // Keep only 10 in sidebar
+  while (list.children.length > 10) list.removeChild(list.lastChild);
+
+  // Flash header anomaly count
+  const el = document.getElementById('h-anomalies');
+  el.classList.remove('bump');
+  void el.offsetWidth;
+  el.classList.add('bump');
+}
+
+// ── Stats update ─────────────────────────────────────────
+function onStats(stats) {
+  // Header
+  document.getElementById('h-total').textContent     = fmtNum(stats.totalLogs);
+  document.getElementById('h-anomalies').textContent  = fmtNum(stats.anomalyCount);
+  document.getElementById('h-rate').textContent       = stats.anomalyRate + '%';
+  document.getElementById('h-lps').textContent        = stats.logsPerSecond;
+
+  // Right sidebar cards
+  document.getElementById('s-avg').textContent  = Math.round(stats.avgResponseTimeMs);
+  document.getElementById('s-p99').textContent  = Math.round(stats.p99ResponseTimeMs);
+  document.getElementById('s-svc').textContent  = stats.activeServices;
+  document.getElementById('s-anom').textContent = fmtNum(stats.anomalyCount);
+
+  // Sparkline
+  sparkData.push(stats.logsPerSecond);
+  sparkData = sparkData.slice(-SPARKLINE_LEN);
+  drawSparkline();
+
+  // Level bars
+  renderLevelBars(stats.levelCounts);
+
+  // Anomaly bars
+  renderAnomalyBars(stats.anomaliesByService);
+
+  // Log count badge
+  document.getElementById('log-count').textContent =
+    `${visibleCount()} / ${logs.length}`;
+}
+
+// ── Log feed rendering ───────────────────────────────────
+function renderFeed() {
+  const feed    = document.getElementById('log-feed');
+  const search  = document.getElementById('search').value.toLowerCase();
+  const visible = logs.filter(e => matchFilter(e, search));
+
+  document.getElementById('log-count').textContent =
+    `${visible.length} / ${logs.length}`;
+
+  // Build rows as HTML string for performance
+  const html = visible.slice(0, 300).map(e => {
+    const rt    = e.responseTimeMs;
+    const rtCls = rt > 1000 ? 'slow' : rt > 400 ? 'med' : 'fast';
+    const anomBadge = e.anomaly
+      ? `<span class="anomaly-badge" title="${escHtml(e.anomalyReason || '')}">⚠</span>`
+      : '';
+    return `<div class="log-row${e.anomaly ? ' anomaly' : ''}">
+      <span class="log-time">${fmtTime(e.timestamp)}</span>
+      <span class="log-level ${e.level}">${e.level}</span>
+      <span class="log-service">${escHtml(e.service)}</span>
+      <span class="log-msg">${escHtml(e.message)}${anomBadge}</span>
+      <span class="log-rt ${rtCls}">${rt}</span>
+    </div>`;
+  }).join('');
+
+  feed.innerHTML = html;
+}
+
+function matchFilter(e, search) {
+  if (activeFilter === 'anomaly' && !e.anomaly) return false;
+  if (activeFilter === 'error'   && e.level !== 'ERROR' && e.level !== 'FATAL') return false;
+  if (activeFilter === 'warn'    && e.level !== 'WARN')  return false;
+  if (search && !e.service.toLowerCase().includes(search) &&
+                !e.message.toLowerCase().includes(search)) return false;
+  return true;
+}
+
+function visibleCount() {
+  const search = document.getElementById('search').value.toLowerCase();
+  return logs.filter(e => matchFilter(e, search)).length;
+}
+
+// ── Services sidebar ─────────────────────────────────────
+function renderServices() {
+  const list  = document.getElementById('service-list');
+  const sorted = Object.entries(serviceStats).sort((a,b) => b[1].anomalies - a[1].anomalies);
+  list.innerHTML = sorted.map(([svc, s]) => {
+    const lvl = s.lastLevel;
+    const dotCls = lvl === 'ERROR' || lvl === 'FATAL' ? 'error'
+                 : lvl === 'WARN'  ? 'warn' : '';
+    const cntCls = s.anomalies > 0 ? 'has-anomaly' : '';
+    return `<div class="service-item">
+      <div class="svc-dot ${dotCls}"></div>
+      <span class="svc-name">${svc}</span>
+      <span class="svc-count ${cntCls}">${s.anomalies > 0 ? '⚠'+s.anomalies : s.total}</span>
+    </div>`;
+  }).join('');
+}
+
+// ── Level bars ───────────────────────────────────────────
+const LEVEL_COLORS = {
+  INFO: '#3fb950', WARN: '#d29922', ERROR: '#f85149',
+  FATAL: '#a371f7', DEBUG: '#484f58'
+};
+
+function renderLevelBars(levelCounts) {
+  if (!levelCounts) return;
+  const total = Object.values(levelCounts).reduce((a,b) => a+b, 0) || 1;
+  const order = ['INFO', 'WARN', 'ERROR', 'FATAL', 'DEBUG'];
+  document.getElementById('level-bars').innerHTML = order.map(lvl => {
+    const cnt = levelCounts[lvl] || 0;
+    const pct = Math.round(cnt / total * 100);
+    return `<div class="level-bar-row">
+      <span class="level-bar-lbl" style="color:${LEVEL_COLORS[lvl]}">${lvl}</span>
+      <div class="level-bar-track">
+        <div class="level-bar-fill" style="width:${pct}%;background:${LEVEL_COLORS[lvl]}"></div>
+      </div>
+      <span class="level-bar-val">${cnt}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderAnomalyBars(byService) {
+  if (!byService || Object.keys(byService).length === 0) {
+    document.getElementById('anomaly-bars').innerHTML =
+      '<div style="color:var(--text-muted);font-size:11px;padding:4px 0">No anomalies yet</div>';
+    return;
+  }
+  const sorted = Object.entries(byService).sort((a,b) => b[1]-a[1]).slice(0,6);
+  const max = sorted[0][1] || 1;
+  document.getElementById('anomaly-bars').innerHTML = sorted.map(([svc, cnt]) => {
+    const pct = Math.round(cnt / max * 100);
+    return `<div class="level-bar-row">
+      <span class="level-bar-lbl" style="color:var(--accent);font-size:9px">${svc.replace('-svc','').replace('-service','')}</span>
+      <div class="level-bar-track">
+        <div class="level-bar-fill" style="width:${pct}%;background:var(--red)"></div>
+      </div>
+      <span class="level-bar-val">${cnt}</span>
+    </div>`;
+  }).join('');
+}
+
+// ── Sparkline ─────────────────────────────────────────────
+function drawSparkline() {
+  const canvas = document.getElementById('sparkline-canvas');
+  const dpr    = window.devicePixelRatio || 1;
+  const w      = canvas.offsetWidth  * dpr;
+  const h      = canvas.offsetHeight * dpr;
+  canvas.width  = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  const cw = canvas.offsetWidth;
+  const ch = canvas.offsetHeight;
+  const max = Math.max(...sparkData, 1);
+  const step = cw / (SPARKLINE_LEN - 1);
+
+  // Fill area
+  ctx.beginPath();
+  ctx.moveTo(0, ch);
+  sparkData.forEach((v, i) => {
+    ctx.lineTo(i * step, ch - (v / max) * (ch - 4));
+  });
+  ctx.lineTo((SPARKLINE_LEN - 1) * step, ch);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0, 0, 0, ch);
+  grad.addColorStop(0,   'rgba(88,166,255,0.3)');
+  grad.addColorStop(1,   'rgba(88,166,255,0)');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  sparkData.forEach((v, i) => {
+    const x = i * step;
+    const y = ch - (v / max) * (ch - 4);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = '#58a6ff';
+  ctx.lineWidth   = 1.5;
+  ctx.stroke();
+}
+
+// ── Controls ─────────────────────────────────────────────
+function setFilter(f) {
+  activeFilter = f;
+  ['all','anomaly','error','warn'].forEach(id => {
+    document.getElementById('btn-'+id).classList.toggle('active', id === f);
+  });
+  renderFeed();
+}
+
+function togglePause() {
+  paused = !paused;
+  const btn = document.getElementById('pause-btn');
+  btn.textContent = paused ? '▶ Resume' : '⏸ Pause';
+  btn.classList.toggle('paused', paused);
+  if (!paused) renderFeed();
+}
+
+document.getElementById('search').addEventListener('input', renderFeed);
+
+// ── Helpers ──────────────────────────────────────────────
+function fmtTime(iso) {
+  const d = new Date(iso);
+  return d.toTimeString().slice(0,8);
+}
+
+function fmtNum(n) {
+  return n >= 1e6 ? (n/1e6).toFixed(1)+'M'
+       : n >= 1e3 ? (n/1e3).toFixed(1)+'K'
+       : String(n);
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+// ── Boot ─────────────────────────────────────────────────
+connect();
+</script>
+</body>
+</html>
